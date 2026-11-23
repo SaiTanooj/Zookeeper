@@ -1,0 +1,159 @@
+// zk.proto - every message our servers and clients exchange.
+//
+// Two services live here:
+//   * ZooKeeper : client  <-> server  (the public API)
+//   * Peer      : server  <-> server  (leader election + liveness)
+//
+// Regenerate the Python code after editing this file:
+//   python -m grpc_tools.protoc -I . --python_out=. --grpc_python_out=. zk/proto/zk.proto
+
+syntax = "proto3";
+
+package zk;
+
+message Empty {}
+
+// ===================================================================
+// Client <-> server
+// ===================================================================
+
+// Error codes are returned inside every response (not as gRPC errors)
+// so the client can turn each one into a clear Python exception.
+// Keep these numbers in sync with zk/common/errors.py.
+enum ErrorCode {
+  OK = 0;
+  NO_NODE = 1;                     // path (or its parent) does not exist
+  NODE_EXISTS = 2;                 // create() on an existing path
+  BAD_VERSION = 3;                 // version check failed
+  NOT_EMPTY = 4;                   // delete() on a node that has children
+  NO_CHILDREN_FOR_EPHEMERALS = 5;  // ephemeral nodes cannot have children
+  BAD_ARGUMENTS = 6;               // malformed path etc.
+  NOT_LEADER = 7;                  // Day 1 only: writes must go to the leader
+}
+
+// Metadata ZooKeeper keeps for every znode.
+message Stat {
+  int64 czxid = 1;           // zxid of the create
+  int64 mzxid = 2;           // zxid of the last setData
+  int64 pzxid = 3;           // zxid of the last child create/delete
+  int64 ctime = 4;           // created at (ms since epoch)
+  int64 mtime = 5;           // modified at (ms since epoch)
+  int32 version = 6;         // number of setData calls
+  int32 cversion = 7;        // number of child changes
+  int64 ephemeral_owner = 8; // session id, 0 for regular nodes
+  int32 data_length = 9;
+  int32 num_children = 10;
+}
+
+message CreateRequest {
+  string path = 1;
+  bytes data = 2;
+  bool ephemeral = 3;
+  bool sequential = 4;
+  int64 session_id = 5;      // owner of an ephemeral node (real sessions arrive on Day 2/3)
+}
+message CreateResponse {
+  ErrorCode err = 1;
+  string path = 2;           // actual path (has the counter for sequential nodes)
+}
+
+message DeleteRequest {
+  string path = 1;
+  int32 version = 2;         // -1 = any version
+}
+message DeleteResponse {
+  ErrorCode err = 1;
+}
+
+message PathRequest {
+  string path = 1;
+}
+
+message ExistsResponse {
+  ErrorCode err = 1;
+  bool exists = 2;
+  Stat stat = 3;
+}
+
+message GetDataResponse {
+  ErrorCode err = 1;
+  bytes data = 2;
+  Stat stat = 3;
+}
+
+message SetDataRequest {
+  string path = 1;
+  bytes data = 2;
+  int32 version = 3;         // -1 = any version
+}
+message SetDataResponse {
+  ErrorCode err = 1;
+  Stat stat = 2;
+}
+
+message GetChildrenResponse {
+  ErrorCode err = 1;
+  repeated string children = 2;
+}
+
+// Lets clients and tools see the role of a server.
+message StatusResponse {
+  int32 server_id = 1;
+  string state = 2;          // LOOKING / FOLLOWING / LEADING
+  int32 leader_id = 3;       // 0 while LOOKING
+  string leader_address = 4; // client address of the leader ("" while LOOKING)
+  int64 last_zxid = 5;
+  int64 current_epoch = 6;
+  int64 election_round = 7;
+  int32 node_count = 8;      // number of znodes in this server's tree
+}
+
+service ZooKeeper {
+  rpc Create(CreateRequest) returns (CreateResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Exists(PathRequest) returns (ExistsResponse);
+  rpc GetData(PathRequest) returns (GetDataResponse);
+  rpc SetData(SetDataRequest) returns (SetDataResponse);
+  rpc GetChildren(PathRequest) returns (GetChildrenResponse);
+  rpc GetStatus(Empty) returns (StatusResponse);
+}
+
+// ===================================================================
+// Server <-> server
+// ===================================================================
+
+enum ServerState {
+  LOOKING = 0;    // running an election
+  FOLLOWING = 1;
+  LEADING = 2;
+}
+
+// "I think <leader> should lead" - plus the facts used to compare votes.
+message Vote {
+  int32 leader = 1;          // proposed leader's server id
+  int64 zxid = 2;            // proposed leader's last zxid
+  int64 epoch = 3;           // proposed leader's current epoch
+}
+
+// One Fast Leader Election message.
+message Notification {
+  int32 sender = 1;
+  ServerState state = 2;     // sender's state
+  Vote vote = 3;             // sender's current vote
+  int64 round = 4;           // sender's election round (the "logical clock")
+}
+
+// Day 1 liveness check (Day 2 replaces it with ZAB's PING over the
+// leader <-> follower stream).
+message PingRequest {
+  int32 sender = 1;
+}
+message PingResponse {
+  ServerState state = 1;     // state of the server that was pinged
+  int32 leader = 2;          // who it thinks the leader is
+}
+
+service Peer {
+  rpc SendNotification(Notification) returns (Empty);
+  rpc Ping(PingRequest) returns (PingResponse);
+}

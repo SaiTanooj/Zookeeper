@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "1": {"host": "127.0.0.1", "client_port": 2181, "peer_port": 2881},
+    "2": {"host": "127.0.0.1", "client_port": 2182, "peer_port": 2882},
+    "3": {"host": "127.0.0.1", "client_port": 2183, "peer_port": 2883},
+    "4": {"host": "127.0.0.1", "client_port": 2184, "peer_port": 2884},
+    "5": {"host": "127.0.0.1", "client_port": 2185, "peer_port": 2885}
+  }
+}
