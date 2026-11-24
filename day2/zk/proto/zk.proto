@@ -1,0 +1,238 @@
+// zk.proto - every message our servers and clients exchange (Day 2).
+//
+// Two services:
+//   * ZooKeeper : client <-> server  (public API + sessions)
+//   * Peer      : server <-> server  (election, ZAB stream, write forwarding)
+//
+// Regenerate the Python code after editing (run from the day2 folder):
+//   python -m grpc_tools.protoc -I . --python_out=. --grpc_python_out=. zk/proto/zk.proto
+
+syntax = "proto3";
+
+package zk;
+
+message Empty {}
+
+// ===================================================================
+// Client <-> server
+// ===================================================================
+
+// Keep these numbers in sync with zk/common/errors.py.
+enum ErrorCode {
+  OK = 0;
+  NO_NODE = 1;
+  NODE_EXISTS = 2;
+  BAD_VERSION = 3;
+  NOT_EMPTY = 4;
+  NO_CHILDREN_FOR_EPHEMERALS = 5;
+  BAD_ARGUMENTS = 6;
+  NOT_READY = 7;        // no active leader right now (election running) - safe to retry
+  SESSION_EXPIRED = 8;  // the session does not exist (any more)
+  CONNECTION_LOSS = 9;  // the outcome of a write is unknown (leader changed mid-write)
+}
+
+message Stat {
+  int64 czxid = 1;
+  int64 mzxid = 2;
+  int64 pzxid = 3;
+  int64 ctime = 4;
+  int64 mtime = 5;
+  int32 version = 6;
+  int32 cversion = 7;
+  int64 ephemeral_owner = 8;
+  int32 data_length = 9;
+  int32 num_children = 10;
+}
+
+// Every request carries the client's session id and an increasing request
+// number (xid). Every response echoes the xid and reports the zxid the
+// server had applied when it answered.
+
+message ConnectRequest {
+  int32 timeout_ms = 1;      // requested session timeout
+}
+message ConnectResponse {
+  ErrorCode err = 1;
+  int64 session_id = 2;
+  int32 timeout_ms = 3;
+  int64 zxid = 4;
+}
+
+message SessionRequest {     // used by Ping and CloseSession
+  int64 session_id = 1;
+  int64 xid = 2;
+}
+message SessionResponse {
+  ErrorCode err = 1;
+  int64 xid = 2;
+  int64 zxid = 3;
+}
+
+message CreateRequest {
+  string path = 1;
+  bytes data = 2;
+  bool ephemeral = 3;
+  bool sequential = 4;
+  int64 session_id = 5;
+  int64 xid = 6;
+}
+message CreateResponse {
+  ErrorCode err = 1;
+  string path = 2;
+  int64 xid = 3;
+  int64 zxid = 4;
+}
+
+message DeleteRequest {
+  string path = 1;
+  int32 version = 2;         // -1 = any version
+  int64 session_id = 3;
+  int64 xid = 4;
+}
+message DeleteResponse {
+  ErrorCode err = 1;
+  int64 xid = 2;
+  int64 zxid = 3;
+}
+
+message PathRequest {
+  string path = 1;
+  int64 session_id = 2;
+  int64 xid = 3;
+}
+
+message ExistsResponse {
+  ErrorCode err = 1;
+  bool exists = 2;
+  Stat stat = 3;
+  int64 xid = 4;
+  int64 zxid = 5;
+}
+
+message GetDataResponse {
+  ErrorCode err = 1;
+  bytes data = 2;
+  Stat stat = 3;
+  int64 xid = 4;
+  int64 zxid = 5;
+}
+
+message SetDataRequest {
+  string path = 1;
+  bytes data = 2;
+  int32 version = 3;
+  int64 session_id = 4;
+  int64 xid = 5;
+}
+message SetDataResponse {
+  ErrorCode err = 1;
+  Stat stat = 2;
+  int64 xid = 3;
+  int64 zxid = 4;
+}
+
+message GetChildrenResponse {
+  ErrorCode err = 1;
+  repeated string children = 2;
+  int64 xid = 3;
+  int64 zxid = 4;
+}
+
+message StatusResponse {
+  int32 server_id = 1;
+  string state = 2;          // LOOKING / FOLLOWING / LEADING
+  bool serving = 3;          // true once synced with an active leader
+  int32 leader_id = 4;
+  int64 current_epoch = 5;
+  int64 last_logged_zxid = 6;    // newest txn in this server's log
+  int64 last_applied_zxid = 7;   // newest txn applied to this server's tree
+  int64 election_round = 8;
+  int32 node_count = 9;
+  int32 session_count = 10;
+}
+
+service ZooKeeper {
+  rpc Connect(ConnectRequest) returns (ConnectResponse);
+  rpc Ping(SessionRequest) returns (SessionResponse);
+  rpc CloseSession(SessionRequest) returns (SessionResponse);
+  rpc Create(CreateRequest) returns (CreateResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Exists(PathRequest) returns (ExistsResponse);
+  rpc GetData(PathRequest) returns (GetDataResponse);
+  rpc SetData(SetDataRequest) returns (SetDataResponse);
+  rpc GetChildren(PathRequest) returns (GetChildrenResponse);
+  rpc GetStatus(Empty) returns (StatusResponse);
+}
+
+// ===================================================================
+// Server <-> server
+// ===================================================================
+
+enum ServerState {
+  LOOKING = 0;
+  FOLLOWING = 1;
+  LEADING = 2;
+}
+
+message Vote {
+  int32 leader = 1;
+  int64 zxid = 2;
+  int64 epoch = 3;
+}
+
+message Notification {
+  int32 sender = 1;
+  ServerState state = 2;
+  Vote vote = 3;
+  int64 round = 4;
+}
+
+// ---- ZAB: one long-lived stream per follower -----------------------
+
+enum ZabType {
+  FOLLOWERINFO = 0;   // F->L  "I am sid, my accepted epoch is X"
+  NEWEPOCH = 1;       // L->F  "the new epoch is E"
+  ACKEPOCH = 2;       // F->L  "I accept epoch E"
+  SNAP = 3;           // L->F  payload = full snapshot of the leader's data
+  NEWLEADER = 4;      // L->F  "you now have my history; confirm"
+  ACK_NEWLEADER = 5;  // F->L
+  UPTODATE = 6;       // L->F  "start serving clients"
+  PROPOSAL = 7;       // L->F  payload = one transaction
+  ACK = 8;            // F->L  "I logged transaction zxid"
+  COMMIT = 9;         // L->F  "apply everything up to zxid"
+  PING = 10;          // both ways: heartbeat
+}
+
+message ZabMessage {
+  ZabType type = 1;
+  int32 sid = 2;       // sender's server id
+  int64 epoch = 3;
+  int64 zxid = 4;
+  bytes payload = 5;   // JSON: a transaction (PROPOSAL) or a snapshot (SNAP)
+}
+
+// ---- Write forwarding: follower -> leader --------------------------
+
+message WriteRequest {
+  string op = 1;       // create / delete / set_data / create_session / close_session
+  string path = 2;
+  bytes data = 3;
+  int32 version = 4;
+  bool ephemeral = 5;
+  bool sequential = 6;
+  int64 session_id = 7;
+  int32 timeout_ms = 8;
+}
+message WriteResponse {
+  ErrorCode err = 1;
+  int64 zxid = 2;
+  string path = 3;
+  Stat stat = 4;
+  int64 session_id = 5;
+}
+
+service Peer {
+  rpc SendNotification(Notification) returns (Empty);
+  rpc Follow(stream ZabMessage) returns (stream ZabMessage);
+  rpc ForwardWrite(WriteRequest) returns (WriteResponse);
+}

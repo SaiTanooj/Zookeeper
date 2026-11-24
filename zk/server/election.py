@@ -118,12 +118,15 @@ class FastLeaderElection:
             else:
                 # The sender already follows or leads somebody.
                 established[n.sender] = (n.vote, n.state)
-                if n.round == self.round:
+                same_round = n.round == self.round
+                if same_round:
                     votes[n.sender] = n.vote
-                    if self._has_quorum(votes, n.vote) and self._leader_confirmed(n.vote, established):
+                    if (self._has_quorum(votes, n.vote)
+                            and self._leader_confirmed(n.vote, established, same_round)):
                         return self._decide(n.vote)
                 est_votes = {sid: v for sid, (v, _) in established.items()}
-                if self._has_quorum(est_votes, n.vote) and self._leader_confirmed(n.vote, established):
+                if (self._has_quorum(est_votes, n.vote)
+                        and self._leader_confirmed(n.vote, established, same_round)):
                     self.round = n.round
                     return self._decide(n.vote)
 
@@ -141,14 +144,18 @@ class FastLeaderElection:
     def _has_quorum(self, votes, vote):
         return sum(1 for v in votes.values() if v == vote) >= self.quorum
 
-    def _leader_confirmed(self, vote, established):
-        """Only follow L if L itself told us it is LEADING.
+    def _leader_confirmed(self, vote, established, same_round):
+        """Is it safe to accept `vote.leader` as the leader?
 
-        This stops us from following a dead leader just because its old
-        followers have not noticed yet.
+        * Someone else: only if it told us itself that it is LEADING. This
+          stops us from following a dead leader just because its old
+          followers have not noticed yet.
+        * Me: only if the majority decided in *this* election round. This
+          happens when the others finished the election before their last
+          LOOKING message reached me; without this rule I would never lead.
         """
         if vote.leader == self.my_id:
-            return False  # others think I lead, but I am LOOKING: start fresh
+            return same_round
         entry = established.get(vote.leader)
         return entry is not None and entry[1] == ServerState.LEADING
 
